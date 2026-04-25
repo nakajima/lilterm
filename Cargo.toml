@@ -1,0 +1,19 @@
+[package]
+name = "lilterm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+crossterm = { version = "0.29.0", features = ["bracketed-paste"] }
+ratatui = { version = "0.30.0", features = ["scrolling-regions", "unstable-backend-writer", "unstable-widget-ref"] }
+unicode-width = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
+ratatui-textarea = "0.9.1"
+smol = "2.0.2"
+vt100 = "0.15.2"
