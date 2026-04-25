@@ -829,6 +829,19 @@ mod tests {
     use ratatui::style::Style;
     use ratatui::text::Line;
 
+    fn clear_from_cursor_down_count(bytes: &[u8]) -> usize {
+        bytes
+            .windows(3)
+            .filter(|window| *window == b"\x1b[J")
+            .count()
+    }
+
+    fn render_numbered_rows(area: Rect, buffer: &mut Buffer) {
+        for y in 0..area.height {
+            buffer.set_string(area.x, area.y + y, format!("row{y}"), Style::default());
+        }
+    }
+
     #[test]
     fn draw_creates_inline_viewport_without_alt_screen() {
         let width: u16 = 20;
@@ -965,12 +978,6 @@ mod tests {
 
     #[test]
     fn finish_scrollback_tail_leaves_visible_tail_in_place_when_viewport_is_full_height() {
-        fn render_rows(area: Rect, buffer: &mut Buffer) {
-            for y in 0..area.height {
-                buffer.set_string(area.x, area.y + y, format!("row{y}"), Style::default());
-            }
-        }
-
         let width: u16 = 12;
         let height: u16 = 5;
         let backend = VT100Backend::new(width, height);
@@ -979,7 +986,7 @@ mod tests {
         let mut state = ScrollbackTailState::new();
 
         viewport
-            .draw_scrollback_tail(&mut state, 8, 1, render_rows, |area, buffer| {
+            .draw_scrollback_tail(&mut state, 8, 1, render_numbered_rows, |area, buffer| {
                 buffer.set_string(area.x, area.y, "prompt", Style::default());
             })
             .unwrap();
@@ -991,7 +998,7 @@ mod tests {
         assert_eq!(state.committed_rows(), 4);
 
         viewport
-            .finish_scrollback_tail(&mut state, 8, render_rows)
+            .finish_scrollback_tail(&mut state, 8, render_numbered_rows)
             .unwrap();
 
         assert_eq!(state, ScrollbackTailState::new());
@@ -1005,6 +1012,196 @@ mod tests {
                     .set_string(area.x, area.y, "prompt", Style::default());
             })
             .unwrap();
+
+        let rows: Vec<String> = viewport
+            .terminal()
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, width)
+            .collect();
+
+        assert!(rows[0].contains("row4"));
+        assert!(rows[1].contains("row5"));
+        assert!(rows[2].contains("row6"));
+        assert!(rows[3].contains("row7"));
+        assert!(rows[4].contains("prompt"));
+    }
+
+    #[test]
+    fn scrollback_tail_grows_down_from_non_bottom_prompt_without_from_cursor_down_clears() {
+        let width: u16 = 12;
+        let height: u16 = 6;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).unwrap();
+        terminal.set_viewport_area(Rect::new(0, 1, width, 1));
+        let mut viewport = InlineViewport::new(terminal);
+        let mut state = ScrollbackTailState::new();
+
+        viewport
+            .draw(1, |frame| {
+                let area = frame.area();
+                frame
+                    .buffer_mut()
+                    .set_string(area.x, area.y, "prompt", Style::default());
+            })
+            .unwrap();
+        let baseline_clears = clear_from_cursor_down_count(viewport.terminal().backend().output());
+
+        for full_height in 1..=3 {
+            viewport
+                .draw_scrollback_tail(
+                    &mut state,
+                    full_height,
+                    1,
+                    render_numbered_rows,
+                    |area, buffer| {
+                        buffer.set_string(area.x, area.y, "prompt", Style::default());
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(state.committed_rows(), 0);
+        assert_eq!(viewport.terminal().viewport_area, Rect::new(0, 1, width, 4));
+        assert_eq!(
+            clear_from_cursor_down_count(viewport.terminal().backend().output()),
+            baseline_clears,
+            "a non-bottom inline viewport should grow downward without clear-from-cursor-down"
+        );
+
+        let rows: Vec<String> = viewport
+            .terminal()
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, width)
+            .collect();
+
+        assert!(rows[1].contains("row0"));
+        assert!(rows[2].contains("row1"));
+        assert!(rows[3].contains("row2"));
+        assert!(rows[4].contains("prompt"));
+    }
+
+    #[test]
+    fn scrollback_tail_flushes_pending_history_before_start_without_full_screen_clear() {
+        let width: u16 = 12;
+        let height: u16 = 6;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).unwrap();
+        terminal.set_viewport_area(Rect::new(0, 1, width, 1));
+        let mut viewport = InlineViewport::new(terminal);
+        let mut state = ScrollbackTailState::new();
+
+        viewport
+            .draw(1, |frame| {
+                let area = frame.area();
+                frame
+                    .buffer_mut()
+                    .set_string(area.x, area.y, "prompt", Style::default());
+            })
+            .unwrap();
+        let baseline_clears = clear_from_cursor_down_count(viewport.terminal().backend().output());
+
+        viewport.insert_history_lines([Line::from("hist0"), Line::from("hist1")]);
+        viewport
+            .draw_scrollback_tail(&mut state, 1, 1, render_numbered_rows, |area, buffer| {
+                buffer.set_string(area.x, area.y, "prompt", Style::default());
+            })
+            .unwrap();
+
+        assert_eq!(state.committed_rows(), 0);
+        assert_eq!(viewport.terminal().viewport_area, Rect::new(0, 3, width, 2));
+        assert_eq!(
+            clear_from_cursor_down_count(viewport.terminal().backend().output()),
+            baseline_clears,
+            "starting a scrollback tail after pending history should not clear from cursor down"
+        );
+
+        let rows: Vec<String> = viewport
+            .terminal()
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, width)
+            .collect();
+
+        assert!(rows.iter().any(|row| row.contains("hist0")));
+        assert!(rows.iter().any(|row| row.contains("hist1")));
+        assert!(rows[3].contains("row0"));
+        assert!(rows[4].contains("prompt"));
+    }
+
+    #[test]
+    fn scrollback_tail_lifecycle_preserves_screen_without_from_cursor_down_clears() {
+        let width: u16 = 12;
+        let height: u16 = 5;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).unwrap();
+        terminal.set_viewport_area(Rect::new(0, height.saturating_sub(1), width, 1));
+        let mut viewport = InlineViewport::new(terminal);
+        let mut state = ScrollbackTailState::new();
+
+        viewport
+            .draw(1, |frame| {
+                let area = frame.area();
+                frame
+                    .buffer_mut()
+                    .set_string(area.x, area.y, "prompt", Style::default());
+            })
+            .unwrap();
+        assert_eq!(viewport.terminal().viewport_area, Rect::new(0, 4, width, 1));
+        let baseline_clears = clear_from_cursor_down_count(viewport.terminal().backend().output());
+
+        for full_height in 1..=8 {
+            viewport
+                .draw_scrollback_tail(
+                    &mut state,
+                    full_height,
+                    1,
+                    render_numbered_rows,
+                    |area, buffer| {
+                        buffer.set_string(area.x, area.y, "prompt", Style::default());
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(state.committed_rows(), 4);
+        assert_eq!(
+            viewport.terminal().viewport_area,
+            Rect::new(0, 0, width, height)
+        );
+        assert_eq!(
+            clear_from_cursor_down_count(viewport.terminal().backend().output()),
+            baseline_clears,
+            "streaming a scrollback tail should use scroll regions and diffing, not clear from cursor down"
+        );
+
+        viewport
+            .finish_scrollback_tail(&mut state, 8, render_numbered_rows)
+            .unwrap();
+        assert_eq!(viewport.terminal().viewport_area, Rect::new(0, 4, width, 1));
+        assert_eq!(
+            clear_from_cursor_down_count(viewport.terminal().backend().output()),
+            baseline_clears,
+            "finishing a scrollback tail should not clear the visible screen"
+        );
+
+        viewport
+            .draw(1, |frame| {
+                let area = frame.area();
+                frame
+                    .buffer_mut()
+                    .set_string(area.x, area.y, "prompt", Style::default());
+            })
+            .unwrap();
+        assert_eq!(
+            clear_from_cursor_down_count(viewport.terminal().backend().output()),
+            baseline_clears,
+            "redrawing the pinned prompt after finish should not clear the visible tail"
+        );
 
         let rows: Vec<String> = viewport
             .terminal()

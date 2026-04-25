@@ -11,23 +11,52 @@ use ratatui::layout::Size;
 use ratatui::prelude::CrosstermBackend;
 
 pub struct VT100Backend {
-    crossterm_backend: CrosstermBackend<vt100::Parser>,
+    crossterm_backend: CrosstermBackend<RecordingWriter>,
+}
+
+struct RecordingWriter {
+    parser: vt100::Parser,
+    bytes: Vec<u8>,
+}
+
+impl RecordingWriter {
+    fn new(width: u16, height: u16) -> Self {
+        Self {
+            parser: vt100::Parser::new(height, width, 100),
+            bytes: Vec::new(),
+        }
+    }
+}
+
+impl Write for RecordingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(buf);
+        self.parser.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.parser.flush()
+    }
 }
 
 impl VT100Backend {
     pub fn new(width: u16, height: u16) -> Self {
         crossterm::style::force_color_output(true);
         Self {
-            crossterm_backend: CrosstermBackend::new(vt100::Parser::new(height, width, 100)),
+            crossterm_backend: CrosstermBackend::new(RecordingWriter::new(width, height)),
         }
     }
 
     pub fn vt100(&self) -> &vt100::Parser {
-        self.crossterm_backend.writer()
+        &self.crossterm_backend.writer().parser
     }
 
     pub fn vt100_mut(&mut self) -> &mut vt100::Parser {
-        self.crossterm_backend.writer_mut()
+        &mut self.crossterm_backend.writer_mut().parser
+    }
+
+    pub fn output(&self) -> &[u8] {
+        &self.crossterm_backend.writer().bytes
     }
 }
 
@@ -43,7 +72,7 @@ impl Write for VT100Backend {
 
 impl fmt::Display for VT100Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.crossterm_backend.writer().screen().contents())
+        write!(f, "{}", self.vt100().screen().contents())
     }
 }
 
