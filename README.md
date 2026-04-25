@@ -160,6 +160,16 @@ session.draw_regions([
 
 Regions are passed in top-to-bottom order. If there is not enough terminal height, lower regions are preserved first, which keeps prompt-like bottom regions stable.
 
+## Debug tracing
+
+Set `LILTERM_TRACE` to log layout decisions to a file:
+
+```sh
+LILTERM_TRACE=/tmp/lilterm-trace.log cargo run --example long_message
+```
+
+`LILTERM_TRACE=1` writes to `/tmp/lilterm-trace.log`. The file is appended to, so remove it before a fresh run if needed.
+
 ## Notes
 
 - The main UI does not use the alternate screen.

@@ -27,6 +27,8 @@ type CursorFn<'a> = dyn Fn(Rect) -> Option<Position> + 'a;
 pub struct ScrollbackTailState {
     committed_rows: u16,
     width: u16,
+    pinned_bottom_height: u16,
+    visible_rows: u16,
 }
 
 impl ScrollbackTailState {
@@ -39,7 +41,14 @@ impl ScrollbackTailState {
     }
 
     pub fn reset(&mut self) {
+        let old = *self;
         *self = Self::default();
+        if old != Self::default() {
+            crate::trace::log_args(format_args!(
+                "scrollback_tail_state.reset old={old:?} new={:?}",
+                self
+            ));
+        }
     }
 }
 
@@ -164,7 +173,13 @@ where
     where
         I: IntoIterator<Item = Line<'static>>,
     {
+        let old_len = self.pending_history_lines.len();
         self.pending_history_lines.extend(lines);
+        crate::trace::log_args(format_args!(
+            "inline.insert_history_lines old_pending={old_len} new_pending={} viewport={:?}",
+            self.pending_history_lines.len(),
+            self.terminal.viewport_area
+        ));
     }
 
     pub fn commit<I>(&mut self, lines: I)
@@ -190,6 +205,13 @@ where
             .fold(0u16, u16::saturating_add)
             .min(screen_size.height);
         let rects = allocate_regions(Rect::new(0, 0, screen_size.width, height), &desired_heights);
+        crate::trace::log_changed_args(
+            "inline.draw_regions.layout",
+            format_args!(
+                "screen={screen_size:?} requested_height={height} desired_heights={desired_heights:?} rects={rects:?} viewport={:?}",
+                self.terminal.viewport_area
+            ),
+        );
 
         self.draw(height, |frame| {
             let area = frame.area();
@@ -234,6 +256,116 @@ where
         )
     }
 
+    pub fn finish_scrollback_tail<F>(
+        &mut self,
+        state: &mut ScrollbackTailState,
+        full_height: u16,
+        render_full: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce(Rect, &mut Buffer),
+    {
+        let screen_size = self.terminal.size()?;
+        let width = screen_size.width;
+        crate::trace::log_args(format_args!(
+            "inline.finish_scrollback_tail start screen={screen_size:?} full_height={full_height} state={state:?} viewport={:?}",
+            self.terminal.viewport_area
+        ));
+        let mut full_buffer = Buffer::empty(Rect::new(0, 0, width, full_height));
+        if width > 0 && full_height > 0 {
+            render_full(full_buffer.area, &mut full_buffer);
+        }
+
+        self.with_synchronized_update(|this| {
+            let mut needs_full_repaint = Self::flush_pending_history_lines(
+                &mut this.terminal,
+                &mut this.pending_history_lines,
+                this.history_mode,
+            )?;
+
+            if state.width != width {
+                let old_state = *state;
+                if state.width == 0 {
+                    state.width = width;
+                } else {
+                    state.width = width;
+                    state.committed_rows = state.committed_rows.min(full_height);
+                }
+                crate::trace::log_args(format_args!(
+                    "inline.finish_scrollback_tail state_width_change old={old_state:?} new={state:?} width={width} full_height={full_height}"
+                ));
+            }
+
+            let viewport_area = this.terminal.viewport_area;
+            let pinned_bottom_height = state.pinned_bottom_height.min(viewport_area.height);
+            let inferred_visible_rows = full_height
+                .saturating_sub(state.committed_rows)
+                .min(viewport_area.height.saturating_sub(pinned_bottom_height));
+            let visible_rows = if state.visible_rows == 0 {
+                inferred_visible_rows
+            } else {
+                state
+                    .visible_rows
+                    .min(viewport_area.height.saturating_sub(pinned_bottom_height))
+            };
+            let target_committed_rows = full_height.saturating_sub(visible_rows);
+
+            if target_committed_rows > state.committed_rows {
+                let rows_to_insert = target_committed_rows - state.committed_rows;
+                crate::trace::log_args(format_args!(
+                    "inline.finish_scrollback_tail insert_overflow start_row={} rows_to_insert={rows_to_insert} full_height={full_height} visible_rows={visible_rows} state={state:?}",
+                    state.committed_rows
+                ));
+                needs_full_repaint |= Self::insert_buffer_rows(
+                    &mut this.terminal,
+                    &full_buffer,
+                    state.committed_rows,
+                    rows_to_insert,
+                    this.history_mode,
+                )?;
+                state.committed_rows = target_committed_rows;
+            }
+
+            let viewport_area = this.terminal.viewport_area;
+            let pinned_bottom_height = pinned_bottom_height.min(viewport_area.height);
+            let visible_rows = visible_rows.min(viewport_area.height.saturating_sub(pinned_bottom_height));
+            let tail_area = Rect::new(
+                viewport_area.x,
+                viewport_area.y,
+                viewport_area.width,
+                visible_rows,
+            );
+            if visible_rows > 0 {
+                Self::draw_buffer_rows_to_area(
+                    &mut this.terminal,
+                    &full_buffer,
+                    state.committed_rows,
+                    tail_area,
+                )?;
+            }
+
+            if pinned_bottom_height < viewport_area.height {
+                let pinned_area = Rect::new(
+                    viewport_area.x,
+                    viewport_area.bottom().saturating_sub(pinned_bottom_height),
+                    viewport_area.width,
+                    pinned_bottom_height,
+                );
+                crate::trace::log_args(format_args!(
+                    "inline.finish_scrollback_tail shrink_to_pinned old_area={viewport_area:?} pinned_area={pinned_area:?} visible_rows={visible_rows} needs_full_repaint={needs_full_repaint}"
+                ));
+                this.terminal.set_viewport_area_preserving_overlap(pinned_area);
+            }
+
+            crate::trace::log_args(format_args!(
+                "inline.finish_scrollback_tail done needs_full_repaint={needs_full_repaint} reset_state_from={state:?} viewport={:?}",
+                this.terminal.viewport_area
+            ));
+            state.reset();
+            Ok(())
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn draw_scrollback_tail_with_chrome<F, C, P>(
         &mut self,
@@ -267,6 +399,14 @@ where
             .saturating_sub(tail_margin.horizontal.saturating_mul(2))
             .max(1);
 
+        crate::trace::log_changed_args(
+            "inline.scrollback_tail.layout",
+            format_args!(
+                "screen={screen_size:?} full_height={full_height} pinned_bottom_height={pinned_bottom_height} tail_margin={tail_margin:?} tail_outer_height={tail_outer_height} tail_content_height={tail_content_height} viewport_height={viewport_height} overflow_rows={overflow_rows} source_width={source_width} state={state:?} viewport={:?}",
+                self.terminal.viewport_area
+            ),
+        );
+
         let mut full_buffer = Buffer::empty(Rect::new(0, 0, width, full_height));
         if width > 0 && full_height > 0 {
             render_full(Rect::new(0, 0, source_width, full_height), &mut full_buffer);
@@ -278,24 +418,46 @@ where
                 this.terminal.clear()?;
             }
 
-            let mut needs_full_repaint = Self::update_inline_viewport(
-                &mut this.terminal,
-                viewport_height,
-                this.history_mode,
-            )?;
-            needs_full_repaint |= Self::flush_pending_history_lines(
+            let mut needs_full_repaint = Self::flush_pending_history_lines(
                 &mut this.terminal,
                 &mut this.pending_history_lines,
                 this.history_mode,
             )?;
+            needs_full_repaint |= Self::update_inline_viewport(
+                &mut this.terminal,
+                viewport_height,
+                this.history_mode,
+            )?;
 
             if state.width != width {
-                state.width = width;
-                state.committed_rows = overflow_rows;
+                let old_state = *state;
+                if state.width == 0 {
+                    state.width = width;
+                } else {
+                    state.width = width;
+                    state.committed_rows = overflow_rows;
+                }
+                crate::trace::log_args(format_args!(
+                    "inline.draw_scrollback_tail_with_chrome state_width_change old={old_state:?} new={state:?} width={width} overflow_rows={overflow_rows}"
+                ));
+            }
+            if state.pinned_bottom_height != pinned_bottom_height
+                || state.visible_rows != tail_content_height
+            {
+                let old_state = *state;
+                state.pinned_bottom_height = pinned_bottom_height;
+                state.visible_rows = tail_content_height;
+                crate::trace::log_args(format_args!(
+                    "inline.draw_scrollback_tail_with_chrome state_layout_change old={old_state:?} new={state:?}"
+                ));
             }
 
             if overflow_rows > state.committed_rows {
                 let rows_to_insert = overflow_rows - state.committed_rows;
+                crate::trace::log_args(format_args!(
+                    "inline.draw_scrollback_tail_with_chrome insert_overflow start_row={} rows_to_insert={rows_to_insert} overflow_rows={overflow_rows} state_before={state:?}",
+                    state.committed_rows
+                ));
                 needs_full_repaint |= Self::insert_buffer_rows(
                     &mut this.terminal,
                     &full_buffer,
@@ -304,11 +466,18 @@ where
                     this.history_mode,
                 )?;
                 state.committed_rows = overflow_rows;
+                crate::trace::log_args(format_args!(
+                    "inline.draw_scrollback_tail_with_chrome state_after_insert state={state:?}"
+                ));
             }
 
-            if needs_full_repaint {
-                this.terminal.invalidate_viewport();
-            }
+            // Scrollback-backed live tails mutate the physical terminal with
+            // scroll-region operations while the wrapped text can also reflow
+            // on every chunk. Force a full repaint so spaces are emitted too;
+            // otherwise stale glyphs from previous wraps or viewport chrome can
+            // survive in cells the widget now considers blank.
+            let _ = needs_full_repaint;
+            this.terminal.invalidate_viewport();
 
             this.terminal.draw(|frame| {
                 let area = frame.area();
@@ -323,6 +492,12 @@ where
                     pinned_height,
                 );
 
+                crate::trace::log_changed_args(
+                    "inline.scrollback_tail.areas",
+                    format_args!(
+                        "frame_area={area:?} tail_outer_area={tail_outer_area:?} tail_content_area={tail_content_area:?} pinned_area={pinned_area:?} state={state:?}"
+                    ),
+                );
                 render_tail_chrome(tail_outer_area, frame.buffer_mut());
                 copy_buffer_rows_to_area(
                     &full_buffer,
@@ -354,6 +529,13 @@ where
         F: FnOnce(&mut Frame) -> Result<(), E>,
         E: Into<io::Error>,
     {
+        crate::trace::log_changed_args(
+            "inline.try_draw.layout",
+            format_args!(
+                "requested_height={height} viewport={:?}",
+                self.terminal.viewport_area
+            ),
+        );
         let mut pending_viewport_area = self.pending_viewport_area()?;
 
         self.with_synchronized_update(|this| {
@@ -407,8 +589,18 @@ where
 
         let old_area = terminal.viewport_area;
         let mut area = old_area;
+        crate::trace::log_changed_args(
+            "inline.update_inline_viewport.request",
+            format_args!(
+                "requested_height={height} mode={mode:?} screen={size:?} old_area={old_area:?}"
+            ),
+        );
         area.height = height.min(size.height);
         area.width = size.width;
+
+        if old_area.bottom() >= size.height && area.height <= old_area.height {
+            area.y = size.height.saturating_sub(area.height);
+        }
 
         if area.y > size.height {
             area.y = size.height.saturating_sub(area.height);
@@ -417,6 +609,9 @@ where
         if area.bottom() > size.height {
             let scroll_by = area.bottom() - size.height;
             if scroll_by > 0 && area.top() > 0 {
+                crate::trace::log_args(format_args!(
+                    "inline.update_inline_viewport bottom_overflow scroll_by={scroll_by} area_before_scroll={area:?} mode={mode:?}"
+                ));
                 if matches!(mode, InsertHistoryMode::Zellij) {
                     Self::scroll_zellij_expanded_viewport(terminal, size, scroll_by)?;
                     needs_full_repaint = true;
@@ -428,13 +623,22 @@ where
         }
 
         if area != old_area {
-            let expands_upward_with_fixed_bottom = area.width == old_area.width
-                && area.bottom() == old_area.bottom()
-                && area.top() < old_area.top();
+            let keeps_bottom_edge =
+                area.width == old_area.width && area.bottom() == old_area.bottom();
+            let grows_downward_from_same_top = area.width == old_area.width
+                && area.top() == old_area.top()
+                && area.height >= old_area.height;
+            let can_preserve_overlap = keeps_bottom_edge || grows_downward_from_same_top;
 
-            if expands_upward_with_fixed_bottom && !needs_full_repaint {
+            if can_preserve_overlap && !needs_full_repaint {
+                crate::trace::log_args(format_args!(
+                    "inline.update_inline_viewport apply_preserve_overlap old_area={old_area:?} new_area={area:?} needs_full_repaint={needs_full_repaint} keeps_bottom_edge={keeps_bottom_edge} grows_downward_from_same_top={grows_downward_from_same_top}"
+                ));
                 terminal.set_viewport_area_preserving_overlap(area);
             } else {
+                crate::trace::log_args(format_args!(
+                    "inline.update_inline_viewport apply_clear_and_set old_area={old_area:?} new_area={area:?} needs_full_repaint={needs_full_repaint} keeps_bottom_edge={keeps_bottom_edge} grows_downward_from_same_top={grows_downward_from_same_top}"
+                ));
                 terminal.clear()?;
                 terminal.set_viewport_area(area);
             }
@@ -467,14 +671,47 @@ where
             return Ok(false);
         }
 
+        crate::trace::log_args(format_args!(
+            "inline.flush_pending_history_lines count={} mode={mode:?} viewport_before={:?}",
+            pending_history_lines.len(),
+            terminal.viewport_area
+        ));
         let lines = pending_history_lines.clone();
         match insert_history_lines_with_mode(terminal, lines, mode) {
             Ok(()) => {
                 pending_history_lines.clear();
-                Ok(matches!(mode, InsertHistoryMode::Zellij))
+                crate::trace::log_args(format_args!(
+                    "inline.flush_pending_history_lines done viewport_after={:?}",
+                    terminal.viewport_area
+                ));
+                Ok(true)
             }
             Err(err) => Err(err),
         }
+    }
+
+    fn draw_buffer_rows_to_area(
+        terminal: &mut Terminal<B>,
+        source: &Buffer,
+        start_row: u16,
+        target_area: Rect,
+    ) -> io::Result<()> {
+        if target_area.is_empty() || terminal.viewport_area.width == 0 {
+            return Ok(());
+        }
+
+        let mut target = Buffer::empty(target_area);
+        copy_buffer_rows_to_area(source, start_row, target_area, &mut target);
+        let iter = target.content.iter().enumerate().map(|(index, cell)| {
+            let (x, y) = target.pos_of(index);
+            (x, y, cell)
+        });
+        terminal.backend_mut().draw(iter)?;
+        terminal.last_known_cursor_pos = Position::new(
+            target_area.x + target_area.width.saturating_sub(1),
+            target_area.y + target_area.height.saturating_sub(1),
+        );
+        Ok(())
     }
 
     fn insert_buffer_rows(
@@ -488,6 +725,10 @@ where
             return Ok(false);
         }
 
+        crate::trace::log_args(format_args!(
+            "inline.insert_buffer_rows start source_area={:?} start_row={start_row} row_count={row_count} mode={mode:?} viewport_before={:?}",
+            source.area, terminal.viewport_area
+        ));
         let cursor_position = terminal.last_known_cursor_pos;
         let draw_rows = |buffer: &mut Buffer| {
             copy_buffer_rows_to_area(source, start_row, buffer.area, buffer);
@@ -503,6 +744,10 @@ where
 
         terminal.set_cursor_position(cursor_position)?;
         terminal.note_history_rows_inserted(row_count);
+        crate::trace::log_args(format_args!(
+            "inline.insert_buffer_rows done viewport_after={:?} restored_cursor={cursor_position:?}",
+            terminal.viewport_area
+        ));
         Ok(true)
     }
 
@@ -519,7 +764,12 @@ where
                     x: 0,
                     y: cursor_pos.y as i32 - last_known_cursor_pos.y as i32,
                 };
-                return Ok(Some(terminal.viewport_area.offset(offset)));
+                let new_area = terminal.viewport_area.offset(offset);
+                crate::trace::log_args(format_args!(
+                    "inline.pending_viewport_area screen_size={screen_size:?} last_screen_size={last_known_screen_size:?} cursor_pos={cursor_pos:?} last_cursor_pos={last_known_cursor_pos:?} old_area={:?} new_area={new_area:?}",
+                    terminal.viewport_area
+                ));
+                return Ok(Some(new_area));
             }
         }
         Ok(None)
@@ -661,6 +911,114 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("row5")));
         assert!(rows.iter().any(|row| row.contains("prompt")));
         assert!(!rows.iter().any(|row| row.contains("row0")));
+    }
+
+    #[test]
+    fn scrollback_tail_with_chrome_repaints_spaces_after_overflow() {
+        use ratatui::layout::Margin;
+        use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+
+        let width: u16 = 36;
+        let height: u16 = 8;
+        let backend = VT100Backend::new(width, height);
+        let terminal = Terminal::with_options(backend).unwrap();
+        let mut viewport = InlineViewport::new(terminal);
+        let mut state = ScrollbackTailState::new();
+        let text = "This is a deliberately long streaming assistant message. ".repeat(8);
+
+        for end in [40usize, 80, 120, 180, 240] {
+            let current = &text[..end.min(text.len())];
+            let full_height = Paragraph::new(current)
+                .wrap(Wrap { trim: true })
+                .line_count(width.saturating_sub(2).max(1)) as u16;
+            viewport
+                .draw_scrollback_tail_with_chrome(
+                    &mut state,
+                    full_height,
+                    1,
+                    Margin::new(1, 1),
+                    |area, buffer| {
+                        Paragraph::new(current)
+                            .wrap(Wrap { trim: true })
+                            .render(area, buffer);
+                    },
+                    |area, buffer| {
+                        Block::default().borders(Borders::ALL).render(area, buffer);
+                    },
+                    |area, buffer| {
+                        buffer.set_string(area.x, area.y, "prompt", Style::default());
+                    },
+                )
+                .unwrap();
+        }
+
+        let rows: Vec<String> = viewport
+            .terminal()
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, width)
+            .collect();
+
+        assert!(rows.iter().any(|row| row.contains("prompt")));
+    }
+
+    #[test]
+    fn finish_scrollback_tail_leaves_visible_tail_in_place_when_viewport_is_full_height() {
+        fn render_rows(area: Rect, buffer: &mut Buffer) {
+            for y in 0..area.height {
+                buffer.set_string(area.x, area.y + y, format!("row{y}"), Style::default());
+            }
+        }
+
+        let width: u16 = 12;
+        let height: u16 = 5;
+        let backend = VT100Backend::new(width, height);
+        let terminal = Terminal::with_options(backend).unwrap();
+        let mut viewport = InlineViewport::new(terminal);
+        let mut state = ScrollbackTailState::new();
+
+        viewport
+            .draw_scrollback_tail(&mut state, 8, 1, render_rows, |area, buffer| {
+                buffer.set_string(area.x, area.y, "prompt", Style::default());
+            })
+            .unwrap();
+
+        assert_eq!(
+            viewport.terminal().viewport_area,
+            Rect::new(0, 0, width, height)
+        );
+        assert_eq!(state.committed_rows(), 4);
+
+        viewport
+            .finish_scrollback_tail(&mut state, 8, render_rows)
+            .unwrap();
+
+        assert_eq!(state, ScrollbackTailState::new());
+        assert_eq!(viewport.terminal().viewport_area, Rect::new(0, 4, width, 1));
+
+        viewport
+            .draw(1, |frame| {
+                let area = frame.area();
+                frame
+                    .buffer_mut()
+                    .set_string(area.x, area.y, "prompt", Style::default());
+            })
+            .unwrap();
+
+        let rows: Vec<String> = viewport
+            .terminal()
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, width)
+            .collect();
+
+        assert!(rows[0].contains("row4"));
+        assert!(rows[1].contains("row5"));
+        assert!(rows[2].contains("row6"));
+        assert!(rows[3].contains("row7"));
+        assert!(rows[4].contains("prompt"));
     }
 
     #[test]

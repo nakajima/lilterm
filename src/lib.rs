@@ -2,6 +2,7 @@ pub mod history;
 pub mod inline;
 pub mod session;
 pub mod terminal;
+pub mod trace;
 
 pub use history::InsertHistoryMode;
 pub use history::ResetScrollRegion;

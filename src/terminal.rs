@@ -215,22 +215,36 @@ where
     }
 
     pub fn resize(&mut self, screen_size: Size) -> io::Result<()> {
+        crate::trace::log_args(format_args!(
+            "terminal.resize old_screen={:?} new_screen={:?} viewport={:?}",
+            self.last_known_screen_size, screen_size, self.viewport_area
+        ));
         self.last_known_screen_size = screen_size;
         Ok(())
     }
 
     pub fn set_viewport_area(&mut self, area: Rect) {
+        let old_area = self.viewport_area;
         self.current_buffer_mut().resize(area);
         self.previous_buffer_mut().resize(area);
         self.viewport_area = area;
         self.visible_history_rows = self.visible_history_rows.min(area.top());
+        crate::trace::log_args(format_args!(
+            "terminal.set_viewport_area old={old_area:?} new={:?} visible_history_rows={}",
+            self.viewport_area, self.visible_history_rows
+        ));
     }
 
     pub(crate) fn set_viewport_area_preserving_overlap(&mut self, area: Rect) {
+        let old_area = self.viewport_area;
         remap_buffer_to_area(self.current_buffer_mut(), area);
         remap_buffer_to_area(self.previous_buffer_mut(), area);
         self.viewport_area = area;
         self.visible_history_rows = self.visible_history_rows.min(area.top());
+        crate::trace::log_args(format_args!(
+            "terminal.set_viewport_area_preserving_overlap old={old_area:?} new={:?} visible_history_rows={}",
+            self.viewport_area, self.visible_history_rows
+        ));
     }
 
     pub fn autoresize(&mut self) -> io::Result<()> {
@@ -319,6 +333,10 @@ where
         if self.viewport_area.is_empty() {
             return Ok(());
         }
+        crate::trace::log_args(format_args!(
+            "terminal.clear viewport={:?}",
+            self.viewport_area
+        ));
         self.set_cursor_position(self.viewport_area.as_position())?;
         queue!(
             self.backend,
@@ -329,6 +347,10 @@ where
     }
 
     pub fn invalidate_viewport(&mut self) {
+        crate::trace::log_changed_args(
+            "terminal.invalidate_viewport",
+            format_args!("viewport={:?}", self.viewport_area),
+        );
         mark_buffer_invalid(self.previous_buffer_mut());
     }
 
@@ -373,10 +395,15 @@ where
     }
 
     pub(crate) fn note_history_rows_inserted(&mut self, inserted_rows: u16) {
+        let old_visible_history_rows = self.visible_history_rows;
         self.visible_history_rows = self
             .visible_history_rows
             .saturating_add(inserted_rows)
             .min(self.viewport_area.top());
+        crate::trace::log_args(format_args!(
+            "terminal.note_history_rows_inserted inserted={inserted_rows} old_visible={old_visible_history_rows} new_visible={} viewport={:?}",
+            self.visible_history_rows, self.viewport_area
+        ));
     }
 
     pub fn swap_buffers(&mut self) {
@@ -394,6 +421,10 @@ where
         }
 
         let size = self.size()?;
+        crate::trace::log_args(format_args!(
+            "terminal.leave_viewport viewport={:?} screen={size:?}",
+            self.viewport_area
+        ));
         if size.height == 0 {
             return Ok(());
         }
@@ -425,6 +456,10 @@ where
         if amount == 0 || region.start >= region.end {
             return Ok(());
         }
+        crate::trace::log_args(format_args!(
+            "terminal.scroll_region_up region={region:?} amount={amount} viewport={:?}",
+            self.viewport_area
+        ));
         queue!(
             self.backend,
             ScrollUpInRegion {
@@ -444,6 +479,10 @@ where
         if amount == 0 || region.start >= region.end {
             return Ok(());
         }
+        crate::trace::log_args(format_args!(
+            "terminal.scroll_region_down region={region:?} amount={amount} viewport={:?}",
+            self.viewport_area
+        ));
         queue!(
             self.backend,
             ScrollDownInRegion {
@@ -459,6 +498,10 @@ where
     where
         F: FnOnce(&mut Buffer),
     {
+        crate::trace::log_args(format_args!(
+            "terminal.insert_before height={height} viewport={:?} screen={:?}",
+            self.viewport_area, self.last_known_screen_size
+        ));
         self.insert_before_scrolling_regions(height, draw_fn)
     }
 
@@ -473,6 +516,10 @@ where
         if height == 0 || self.viewport_area.width == 0 {
             return Ok(());
         }
+        crate::trace::log_args(format_args!(
+            "terminal.insert_before_without_scrolling_regions height={height} viewport={:?} screen={:?}",
+            self.viewport_area, self.last_known_screen_size
+        ));
 
         let area = Rect {
             x: 0,
@@ -523,6 +570,10 @@ where
         if height == 0 || self.viewport_area.width == 0 {
             return Ok(());
         }
+        crate::trace::log_args(format_args!(
+            "terminal.insert_before_scrolling_regions start height={height} viewport={:?} screen={:?}",
+            self.viewport_area, self.last_known_screen_size
+        ));
 
         let area = Rect {
             x: 0,
@@ -535,6 +586,10 @@ where
         let mut buffer = buffer.content.as_slice();
 
         if self.viewport_area.height == self.last_known_screen_size.height {
+            crate::trace::log_args(format_args!(
+                "terminal.insert_before_scrolling_regions full_height height={height} viewport={:?}",
+                self.viewport_area
+            ));
             while !buffer.is_empty() {
                 buffer = self.draw_lines(0, 1, buffer)?;
                 self.scroll_region_up_queued(0..1, 1)?;
@@ -552,6 +607,9 @@ where
             let screen_bottom = self.last_known_screen_size.height;
             if viewport_bottom < screen_bottom {
                 let to_draw = height.min(screen_bottom - viewport_bottom);
+                crate::trace::log_args(format_args!(
+                    "terminal.insert_before_scrolling_regions shift_down to_draw={to_draw} viewport_top={viewport_top} viewport_bottom={viewport_bottom} screen_bottom={screen_bottom}"
+                ));
                 self.scroll_region_down_queued(viewport_top..viewport_bottom + to_draw, to_draw)?;
                 buffer = self.draw_lines(viewport_top, to_draw, buffer)?;
                 self.set_viewport_area(Rect {
@@ -565,6 +623,9 @@ where
         let viewport_top = self.viewport_area.top();
         while height > 0 {
             let to_draw = height.min(viewport_top);
+            crate::trace::log_args(format_args!(
+                "terminal.insert_before_scrolling_regions scroll_above to_draw={to_draw} viewport_top={viewport_top} remaining_height={height}"
+            ));
             self.scroll_region_up_queued(0..viewport_top, to_draw)?;
             buffer = self.draw_lines(viewport_top - to_draw, to_draw, buffer)?;
             height -= to_draw;
@@ -606,7 +667,10 @@ where
 
 fn mark_buffer_invalid(buffer: &mut Buffer) {
     for cell in &mut buffer.content {
-        cell.set_symbol("x");
+        cell.set_symbol(" ");
+        cell.fg = Color::Indexed(255);
+        cell.bg = Color::Indexed(254);
+        cell.modifier = Modifier::RAPID_BLINK;
     }
 }
 
@@ -710,6 +774,12 @@ impl DrawCommand {
     }
 }
 
+fn is_invalidated_cell(cell: &Cell) -> bool {
+    cell.fg == Color::Indexed(255)
+        && cell.bg == Color::Indexed(254)
+        && cell.modifier.contains(Modifier::RAPID_BLINK)
+}
+
 fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
     let previous_buffer = &a.content;
     let next_buffer = &b.content;
@@ -738,7 +808,10 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
             && previous_buffer[row_start + clear_start..row_end]
                 .iter()
                 .any(|cell| {
-                    cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty()
+                    is_invalidated_cell(cell)
+                        || cell.symbol() != " "
+                        || cell.bg != bg
+                        || cell.modifier != Modifier::empty()
                 })
         {
             let (x, y) = a.pos_of(row_start + clear_start);
@@ -751,7 +824,10 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
     let mut invalidated: usize = 0;
     let mut to_skip: usize = 0;
     for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
-        if !current.skip && (current != previous || invalidated > 0) && to_skip == 0 {
+        if !current.skip
+            && (is_invalidated_cell(previous) || current != previous || invalidated > 0)
+            && to_skip == 0
+        {
             let (x, y) = a.pos_of(i);
             let row = i / a.area.width as usize;
             if x <= last_nonblank_columns[row] {
