@@ -58,6 +58,22 @@ This example uses:
 - `smol` + async/await for the event loop
 - `lilterm` for scrollback insertion and inline viewport management
 
+### Multiple live regions
+
+```sh
+cargo run --example live_regions
+```
+
+This example uses the higher-level `LiveRegion` API. It renders multiple live-updating regions at once while completed lines from each stream are committed into native scrollback.
+
+### Long growing message with a pinned prompt
+
+```sh
+cargo run --example long_message
+```
+
+This intentionally streams one long live paragraph. It uses `draw_scrollback_tail` to move newly-overflowed rows into native scrollback while keeping the prompt pinned to the bottom.
+
 ## api
 
 ### session
@@ -91,6 +107,58 @@ session.draw(height, |frame| {
 ```
 
 Only render the live/unstable UI here: prompt editor, current partial response, status, spinner, etc.
+
+### draw a scrollback-backed live tail
+
+```rust,ignore
+let full_height = app.message_height(width);
+
+session.draw_scrollback_tail(
+    &mut tail_state,
+    full_height,
+    prompt_height,
+    |area, buf| app.render_full_message(area, buf),
+    |area, buf| app.render_prompt(area, buf),
+)?;
+```
+
+The full message is rendered into an offscreen buffer. Newly-overflowed top rows are inserted into native scrollback, and only the live tail remains above the pinned bottom region.
+
+If the live tail needs viewport chrome such as a border, keep that chrome separate from scrollback content:
+
+```rust,ignore
+session.draw_scrollback_tail_with_chrome(
+    &mut tail_state,
+    full_height,
+    prompt_height,
+    ratatui::layout::Margin::new(1, 1),
+    |area, buf| app.render_full_message_content(area, buf),
+    |area, buf| app.render_live_message_border(area, buf),
+    |area, buf| app.render_prompt(area, buf),
+)?;
+```
+
+### draw multiple live regions
+
+```rust,ignore
+session.commit(app.take_committed_lines());
+
+session.draw_regions([
+    LiveRegion::new("agent")
+        .fixed_height(3)
+        .render(|area, buf| agent_tail.render(area, buf)),
+    LiveRegion::new("tool")
+        .fixed_height(3)
+        .render(|area, buf| tool_tail.render(area, buf)),
+    LiveRegion::new("prompt")
+        .min_height(3)
+        .max_height(8)
+        .height(|width| prompt.desired_height(width))
+        .render(|area, buf| prompt.render(area, buf)),
+])?;
+```
+
+Regions are passed in top-to-bottom order. If there is not enough terminal height, lower regions are preserved first, which keeps prompt-like bottom regions stable.
 
 ## Notes
 

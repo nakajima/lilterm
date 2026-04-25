@@ -22,10 +22,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+use std::fmt;
 use std::io;
 use std::io::Write;
 
+use crossterm::cursor::Hide;
 use crossterm::cursor::MoveTo;
+use crossterm::cursor::Show;
 use crossterm::queue;
 use crossterm::style::Colors;
 use crossterm::style::Print;
@@ -223,6 +226,13 @@ where
         self.visible_history_rows = self.visible_history_rows.min(area.top());
     }
 
+    pub(crate) fn set_viewport_area_preserving_overlap(&mut self, area: Rect) {
+        remap_buffer_to_area(self.current_buffer_mut(), area);
+        remap_buffer_to_area(self.previous_buffer_mut(), area);
+        self.viewport_area = area;
+        self.visible_history_rows = self.visible_history_rows.min(area.top());
+    }
+
     pub fn autoresize(&mut self) -> io::Result<()> {
         let screen_size = self.size()?;
         if screen_size != self.last_known_screen_size {
@@ -283,13 +293,13 @@ where
     }
 
     pub fn hide_cursor(&mut self) -> io::Result<()> {
-        self.backend.hide_cursor()?;
+        queue!(self.backend, Hide)?;
         self.hidden_cursor = true;
         Ok(())
     }
 
     pub fn show_cursor(&mut self) -> io::Result<()> {
-        self.backend.show_cursor()?;
+        queue!(self.backend, Show)?;
         self.hidden_cursor = false;
         Ok(())
     }
@@ -300,7 +310,7 @@ where
 
     pub fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
         let position = position.into();
-        self.backend.set_cursor_position(position)?;
+        queue!(self.backend, MoveTo(position.x, position.y))?;
         self.last_known_cursor_pos = position;
         Ok(())
     }
@@ -309,15 +319,17 @@ where
         if self.viewport_area.is_empty() {
             return Ok(());
         }
-        self.backend
-            .set_cursor_position(self.viewport_area.as_position())?;
-        self.backend.clear_region(ClearType::AfterCursor)?;
+        self.set_cursor_position(self.viewport_area.as_position())?;
+        queue!(
+            self.backend,
+            Clear(crossterm::terminal::ClearType::FromCursorDown)
+        )?;
         self.previous_buffer_mut().reset();
         Ok(())
     }
 
     pub fn invalidate_viewport(&mut self) {
-        self.previous_buffer_mut().reset();
+        mark_buffer_invalid(self.previous_buffer_mut());
     }
 
     pub fn clear_scrollback(&mut self) -> io::Result<()> {
@@ -374,6 +386,73 @@ where
 
     pub fn size(&self) -> io::Result<Size> {
         self.backend.size()
+    }
+
+    pub fn leave_viewport(&mut self) -> io::Result<()> {
+        if self.viewport_area.is_empty() {
+            return Ok(());
+        }
+
+        let size = self.size()?;
+        if size.height == 0 {
+            return Ok(());
+        }
+
+        let bottom = self.viewport_area.bottom().min(size.height);
+        if bottom < size.height {
+            self.set_cursor_position(Position { x: 0, y: bottom })?;
+        } else {
+            queue!(
+                self.backend,
+                MoveTo(0, size.height.saturating_sub(1)),
+                Print("\n")
+            )?;
+            self.last_known_cursor_pos = Position {
+                x: 0,
+                y: size.height.saturating_sub(1),
+            };
+        }
+
+        Write::flush(&mut self.backend)?;
+        Ok(())
+    }
+
+    pub(crate) fn scroll_region_up_queued(
+        &mut self,
+        region: std::ops::Range<u16>,
+        amount: u16,
+    ) -> io::Result<()> {
+        if amount == 0 || region.start >= region.end {
+            return Ok(());
+        }
+        queue!(
+            self.backend,
+            ScrollUpInRegion {
+                first_row: region.start,
+                last_row: region.end.saturating_sub(1),
+                lines_to_scroll: amount,
+            }
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn scroll_region_down_queued(
+        &mut self,
+        region: std::ops::Range<u16>,
+        amount: u16,
+    ) -> io::Result<()> {
+        if amount == 0 || region.start >= region.end {
+            return Ok(());
+        }
+        queue!(
+            self.backend,
+            ScrollDownInRegion {
+                first_row: region.start,
+                last_row: region.end.saturating_sub(1),
+                lines_to_scroll: amount,
+            }
+        )?;
+        Ok(())
     }
 
     pub fn insert_before<F>(&mut self, height: u16, draw_fn: F) -> io::Result<()>
@@ -456,20 +535,14 @@ where
         let mut buffer = buffer.content.as_slice();
 
         if self.viewport_area.height == self.last_known_screen_size.height {
-            let mut first = true;
             while !buffer.is_empty() {
-                buffer = if first {
-                    self.draw_lines(0, 1, buffer)?
-                } else {
-                    self.draw_lines_over_cleared(0, 1, buffer)?
-                };
-                first = false;
-                self.backend.scroll_region_up(0..1, 1)?;
+                buffer = self.draw_lines(0, 1, buffer)?;
+                self.scroll_region_up_queued(0..1, 1)?;
             }
 
             let width = self.viewport_area.width as usize;
             let top_line = self.buffers[1 - self.current].content[0..width].to_vec();
-            self.draw_lines_over_cleared(0, 1, &top_line)?;
+            self.draw_lines(0, 1, &top_line)?;
             return Ok(());
         }
 
@@ -479,9 +552,8 @@ where
             let screen_bottom = self.last_known_screen_size.height;
             if viewport_bottom < screen_bottom {
                 let to_draw = height.min(screen_bottom - viewport_bottom);
-                self.backend
-                    .scroll_region_down(viewport_top..viewport_bottom + to_draw, to_draw)?;
-                buffer = self.draw_lines_over_cleared(viewport_top, to_draw, buffer)?;
+                self.scroll_region_down_queued(viewport_top..viewport_bottom + to_draw, to_draw)?;
+                buffer = self.draw_lines(viewport_top, to_draw, buffer)?;
                 self.set_viewport_area(Rect {
                     y: viewport_top + to_draw,
                     ..self.viewport_area
@@ -493,8 +565,8 @@ where
         let viewport_top = self.viewport_area.top();
         while height > 0 {
             let to_draw = height.min(viewport_top);
-            self.backend.scroll_region_up(0..viewport_top, to_draw)?;
-            buffer = self.draw_lines_over_cleared(viewport_top - to_draw, to_draw, buffer)?;
+            self.scroll_region_up_queued(0..viewport_top, to_draw)?;
+            buffer = self.draw_lines(viewport_top - to_draw, to_draw, buffer)?;
             height -= to_draw;
         }
 
@@ -516,29 +588,6 @@ where
                 .enumerate()
                 .map(|(i, cell)| ((i % width) as u16, y_offset + (i / width) as u16, cell));
             self.backend.draw(iter)?;
-            Backend::flush(&mut self.backend)?;
-        }
-        Ok(remainder)
-    }
-
-    fn draw_lines_over_cleared<'a>(
-        &mut self,
-        y_offset: u16,
-        lines_to_draw: u16,
-        cells: &'a [Cell],
-    ) -> io::Result<&'a [Cell]> {
-        let width: usize = self.viewport_area.width.into();
-        let count = width * lines_to_draw as usize;
-        let (to_draw, remainder) = cells.split_at(count.min(cells.len()));
-        if lines_to_draw > 0 {
-            let area = Rect::new(0, y_offset, width as u16, lines_to_draw);
-            let old = Buffer::empty(area);
-            let new = Buffer {
-                area,
-                content: to_draw.to_vec(),
-            };
-            self.backend.draw(old.diff(&new).into_iter())?;
-            Backend::flush(&mut self.backend)?;
         }
         Ok(remainder)
     }
@@ -552,6 +601,100 @@ where
             self.backend.append_lines(lines_to_scroll)?;
         }
         Ok(())
+    }
+}
+
+fn mark_buffer_invalid(buffer: &mut Buffer) {
+    for cell in &mut buffer.content {
+        cell.set_symbol("x");
+    }
+}
+
+fn remap_buffer_to_area(buffer: &mut Buffer, area: Rect) {
+    if buffer.area == area {
+        return;
+    }
+
+    let old = std::mem::replace(buffer, Buffer::empty(area));
+    let overlap = old.area.intersection(area);
+    for y in overlap.top()..overlap.bottom() {
+        for x in overlap.left()..overlap.right() {
+            let Some(source) = old.cell((x, y)) else {
+                continue;
+            };
+            let Some(target) = buffer.cell_mut((x, y)) else {
+                continue;
+            };
+            *target = source.clone();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollUpInRegion {
+    first_row: u16,
+    last_row: u16,
+    lines_to_scroll: u16,
+}
+
+impl crossterm::Command for ScrollUpInRegion {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        if self.lines_to_scroll == 0 {
+            return Ok(());
+        }
+        write!(
+            f,
+            "\x1b[{};{}r\x1b[{}S\x1b[r",
+            self.first_row.saturating_add(1),
+            self.last_row.saturating_add(1),
+            self.lines_to_scroll
+        )
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "ScrollUpInRegion requires ANSI command execution",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollDownInRegion {
+    first_row: u16,
+    last_row: u16,
+    lines_to_scroll: u16,
+}
+
+impl crossterm::Command for ScrollDownInRegion {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        if self.lines_to_scroll == 0 {
+            return Ok(());
+        }
+        write!(
+            f,
+            "\x1b[{};{}r\x1b[{}T\x1b[r",
+            self.first_row.saturating_add(1),
+            self.last_row.saturating_add(1),
+            self.lines_to_scroll
+        )
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "ScrollDownInRegion requires ANSI command execution",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
     }
 }
 
@@ -590,8 +733,15 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
             column += width.max(1);
         }
 
-        if last_nonblank_column + 1 < row.len() {
-            let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
+        let clear_start = last_nonblank_column + 1;
+        if clear_start < row.len()
+            && previous_buffer[row_start + clear_start..row_end]
+                .iter()
+                .any(|cell| {
+                    cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty()
+                })
+        {
+            let (x, y) = a.pos_of(row_start + clear_start);
             updates.push(DrawCommand::ClearToEnd { x, y, bg });
         }
 
@@ -775,6 +925,82 @@ mod tests {
             commands
                 .iter()
                 .any(|command| matches!(command, DrawCommand::Put { x: 2, y: 0, .. }))
+        );
+    }
+
+    #[test]
+    fn diff_buffers_does_not_clear_identical_trailing_blank_cells() {
+        let area = Rect::new(0, 0, 10, 1);
+        let mut previous = Buffer::empty(area);
+        previous.set_string(0, 0, "hello", Style::default());
+        let next = previous.clone();
+
+        let commands = diff_buffers(&previous, &next);
+
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn diff_buffers_clears_stale_trailing_cells() {
+        let area = Rect::new(0, 0, 10, 1);
+        let mut previous = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+        previous.set_string(0, 0, "hello", Style::default());
+        next.set_string(0, 0, "hi", Style::default());
+
+        let commands = diff_buffers(&previous, &next);
+
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 2, y: 0, .. }))
+        );
+    }
+
+    #[test]
+    fn leave_viewport_moves_cursor_below_viewport_without_clearing_when_room() {
+        let width: u16 = 12;
+        let height: u16 = 6;
+        let backend = crate::test_backend::VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).unwrap();
+        terminal.set_viewport_area(Rect::new(0, 2, width, 2));
+
+        terminal
+            .draw(|frame| {
+                frame
+                    .buffer_mut()
+                    .set_string(0, 2, "live row", Style::default());
+            })
+            .unwrap();
+        terminal.leave_viewport().unwrap();
+
+        let rows: Vec<String> = terminal.backend().vt100().screen().rows(0, width).collect();
+        assert!(rows.iter().any(|row| row.contains("live row")));
+        assert_eq!(
+            terminal.backend().vt100().screen().cursor_position(),
+            (4, 0)
+        );
+    }
+
+    #[test]
+    fn invalidating_viewport_forces_blank_cells_to_be_redrawn_inside_bordered_rows() {
+        let area = Rect::new(0, 0, 8, 1);
+        let mut previous = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+        next.set_string(0, 0, "|a b  |", Style::default());
+
+        mark_buffer_invalid(&mut previous);
+        let commands = diff_buffers(&previous, &next);
+
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Put { x: 2, y: 0, cell } if cell.symbol() == " "))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Put { x: 5, y: 0, cell } if cell.symbol() == " "))
         );
     }
 

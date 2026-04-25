@@ -89,11 +89,13 @@ impl Session {
     }
 
     pub fn finish(mut self) -> io::Result<()> {
-        let result = restore();
-        if result.is_ok() {
+        let leave_result = self.viewport.terminal_mut().leave_viewport();
+        let restore_result = restore();
+        if restore_result.is_ok() {
             self.restore_on_drop = false;
         }
-        result
+
+        leave_result.and(restore_result)
     }
 }
 
@@ -114,6 +116,7 @@ impl DerefMut for Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if self.restore_on_drop {
+            let _ = self.viewport.terminal_mut().leave_viewport();
             let _ = restore();
         }
     }

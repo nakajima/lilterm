@@ -9,6 +9,8 @@ pub use history::SetScrollRegion;
 pub use history::insert_history_lines;
 pub use history::insert_history_lines_with_mode;
 pub use inline::InlineViewport;
+pub use inline::LiveRegion;
+pub use inline::ScrollbackTailState;
 pub use session::CrosstermInlineViewport;
 pub use session::CrosstermTerminal;
 pub use session::Session;
