@@ -1,8 +1,6 @@
-use std::fmt;
 use std::io;
 use std::io::Write;
 
-use crossterm::Command;
 use ratatui::backend::Backend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Style;
@@ -11,36 +9,9 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::terminal::Terminal;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InsertHistoryMode {
-    Standard,
-    Zellij,
-}
-
-impl InsertHistoryMode {
-    pub fn new(is_zellij: bool) -> Self {
-        if is_zellij {
-            Self::Zellij
-        } else {
-            Self::Standard
-        }
-    }
-}
-
 pub fn insert_history_lines<'a, B>(
     terminal: &mut Terminal<B>,
     lines: Vec<Line<'a>>,
-) -> io::Result<()>
-where
-    B: Backend<Error = io::Error> + Write,
-{
-    insert_history_lines_with_mode(terminal, lines, InsertHistoryMode::Standard)
-}
-
-pub fn insert_history_lines_with_mode<'a, B>(
-    terminal: &mut Terminal<B>,
-    lines: Vec<Line<'a>>,
-    mode: InsertHistoryMode,
 ) -> io::Result<()>
 where
     B: Backend<Error = io::Error> + Write,
@@ -58,13 +29,7 @@ where
     let last_cursor_pos = terminal.last_known_cursor_pos;
     let draw_lines = |buffer: &mut Buffer| render_lines_to_buffer(buffer, &lines, width);
 
-    match mode {
-        InsertHistoryMode::Standard => terminal.insert_before(inserted_rows, draw_lines)?,
-        InsertHistoryMode::Zellij => {
-            terminal.insert_before_without_scrolling_regions(inserted_rows, draw_lines)?;
-            terminal.invalidate_viewport();
-        }
-    }
+    terminal.insert_before(inserted_rows, draw_lines)?;
 
     terminal.set_cursor_position(last_cursor_pos)?;
     terminal.note_history_rows_inserted(inserted_rows);
@@ -137,48 +102,6 @@ fn render_lines_to_buffer(buffer: &mut Buffer, lines: &[Line<'_>], wrap_width: u
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SetScrollRegion(pub std::ops::Range<u16>);
-
-impl Command for SetScrollRegion {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        write!(f, "\x1b[{};{}r", self.0.start, self.0.end)
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "SetScrollRegion requires ANSI command execution",
-        ))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        true
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResetScrollRegion;
-
-impl Command for ResetScrollRegion {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        write!(f, "\x1b[r")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "ResetScrollRegion requires ANSI command execution",
-        ))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,27 +122,6 @@ mod tests {
 
         let rows: Vec<String> = term.backend().vt100().screen().rows(0, width).collect();
         assert!(rows.iter().any(|row| row.contains("history row")));
-        assert_eq!(term.viewport_area, Rect::new(0, 5, width, 2));
-        assert_eq!(term.visible_history_rows(), 1);
-    }
-
-    #[test]
-    fn vt100_zellij_mode_inserts_history_and_updates_viewport() {
-        let width: u16 = 32;
-        let height: u16 = 8;
-        let backend = VT100Backend::new(width, height);
-        let mut term = Terminal::with_options(backend).unwrap();
-        term.set_viewport_area(Rect::new(0, 4, width, 2));
-
-        insert_history_lines_with_mode(
-            &mut term,
-            vec![Line::from("zellij history")],
-            InsertHistoryMode::Zellij,
-        )
-        .unwrap();
-
-        let rows: Vec<String> = term.backend().vt100().screen().rows(0, width).collect();
-        assert!(rows.iter().any(|row| row.contains("zellij history")));
         assert_eq!(term.viewport_area, Rect::new(0, 5, width, 2));
         assert_eq!(term.visible_history_rows(), 1);
     }

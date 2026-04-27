@@ -38,7 +38,6 @@ use crossterm::style::SetColors;
 use crossterm::style::SetForegroundColor;
 use crossterm::terminal::Clear;
 use ratatui::backend::Backend;
-use ratatui::backend::ClearType;
 use ratatui::buffer::Buffer;
 use ratatui::buffer::Cell;
 use ratatui::layout::Position;
@@ -354,42 +353,6 @@ where
         mark_buffer_invalid(self.previous_buffer_mut());
     }
 
-    pub fn clear_scrollback(&mut self) -> io::Result<()> {
-        if self.viewport_area.is_empty() {
-            return Ok(());
-        }
-        let home = Position { x: 0, y: 0 };
-        self.set_cursor_position(home)?;
-        queue!(self.backend, Clear(crossterm::terminal::ClearType::Purge))?;
-        self.set_cursor_position(home)?;
-        Write::flush(&mut self.backend)?;
-        self.previous_buffer_mut().reset();
-        Ok(())
-    }
-
-    pub fn clear_visible_screen(&mut self) -> io::Result<()> {
-        let home = Position { x: 0, y: 0 };
-        self.set_cursor_position(home)?;
-        self.backend.clear_region(ClearType::All)?;
-        self.set_cursor_position(home)?;
-        Write::flush(&mut self.backend)?;
-        self.visible_history_rows = 0;
-        self.previous_buffer_mut().reset();
-        Ok(())
-    }
-
-    pub fn clear_scrollback_and_visible_screen_ansi(&mut self) -> io::Result<()> {
-        if self.viewport_area.is_empty() {
-            return Ok(());
-        }
-        write!(self.backend, "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
-        Write::flush(&mut self.backend)?;
-        self.last_known_cursor_pos = Position { x: 0, y: 0 };
-        self.visible_history_rows = 0;
-        self.previous_buffer_mut().reset();
-        Ok(())
-    }
-
     pub fn visible_history_rows(&self) -> u16 {
         self.visible_history_rows
     }
@@ -505,64 +468,6 @@ where
         self.insert_before_scrolling_regions(height, draw_fn)
     }
 
-    pub(crate) fn insert_before_without_scrolling_regions<F>(
-        &mut self,
-        height: u16,
-        draw_fn: F,
-    ) -> io::Result<()>
-    where
-        F: FnOnce(&mut Buffer),
-    {
-        if height == 0 || self.viewport_area.width == 0 {
-            return Ok(());
-        }
-        crate::trace::log_args(format_args!(
-            "terminal.insert_before_without_scrolling_regions height={height} viewport={:?} screen={:?}",
-            self.viewport_area, self.last_known_screen_size
-        ));
-
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: self.viewport_area.width,
-            height,
-        };
-        let mut buffer = Buffer::empty(area);
-        draw_fn(&mut buffer);
-        let mut buffer = buffer.content.as_slice();
-
-        let mut drawn_height: i32 = self.viewport_area.top().into();
-        let mut buffer_height: i32 = height.into();
-        let viewport_height: i32 = self.viewport_area.height.into();
-        let screen_height: i32 = self.last_known_screen_size.height.into();
-
-        while buffer_height + viewport_height > screen_height {
-            let to_draw = buffer_height.min(screen_height);
-            let scroll_up = 0.max(drawn_height + to_draw - screen_height);
-            self.scroll_up_without_scrolling_regions(scroll_up as u16)?;
-            buffer = self.draw_lines((drawn_height - scroll_up) as u16, to_draw as u16, buffer)?;
-            drawn_height += to_draw - scroll_up;
-            buffer_height -= to_draw;
-        }
-
-        let scroll_up = 0.max(drawn_height + buffer_height + viewport_height - screen_height);
-        self.scroll_up_without_scrolling_regions(scroll_up as u16)?;
-        self.draw_lines(
-            (drawn_height - scroll_up) as u16,
-            buffer_height as u16,
-            buffer,
-        )?;
-        drawn_height += buffer_height - scroll_up;
-
-        self.set_viewport_area(Rect {
-            y: drawn_height as u16,
-            ..self.viewport_area
-        });
-        self.clear()?;
-
-        Ok(())
-    }
-
     fn insert_before_scrolling_regions<F>(&mut self, mut height: u16, draw_fn: F) -> io::Result<()>
     where
         F: FnOnce(&mut Buffer),
@@ -651,17 +556,6 @@ where
             self.backend.draw(iter)?;
         }
         Ok(remainder)
-    }
-
-    fn scroll_up_without_scrolling_regions(&mut self, lines_to_scroll: u16) -> io::Result<()> {
-        if lines_to_scroll > 0 {
-            self.backend.set_cursor_position(Position::new(
-                0,
-                self.last_known_screen_size.height.saturating_sub(1),
-            ))?;
-            self.backend.append_lines(lines_to_scroll)?;
-        }
-        Ok(())
     }
 }
 

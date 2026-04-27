@@ -3,9 +3,9 @@
 //! This intentionally does *not* use the newline-gated commit model from the
 //! other examples. Instead, it keeps one assistant message live while it grows.
 //!
-//! `draw_scrollback_tail` renders the full message into an offscreen buffer,
-//! inserts newly overflowed top rows into native scrollback, and keeps only the
-//! live tail above a pinned prompt editor.
+//! `draw_layout_tail` renders the layout into an offscreen virtual buffer,
+//! inserts newly overflowed inline rows into native scrollback, and keeps only
+//! the live tail above a pinned prompt editor.
 //!
 //! Run with:
 //!
@@ -22,10 +22,10 @@ use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
+use lilterm::Region;
 use lilterm::ScrollbackTailState;
 use lilterm::init;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Margin;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
@@ -64,16 +64,13 @@ fn main() -> io::Result<()> {
             break;
         }
 
-        let size = session.terminal().size()?;
-        let full_height = app.message_height(size.width);
-        session.draw_scrollback_tail_with_chrome(
+        session.draw_layout_tail(
             &mut tail_state,
-            full_height,
-            PROMPT_HEIGHT,
-            Margin::new(1, 1),
-            |area, buffer| app.render_message(area, buffer),
-            |area, buffer| app.render_message_chrome(area, buffer),
-            |area, buffer| app.render_prompt(area, buffer),
+            [Region::inline_min(1), Region::pinned_bottom(PROMPT_HEIGHT)],
+            |frame| {
+                app.render_message(frame.area(0), frame.buffer_mut());
+                app.render_prompt(frame.area(1), frame.buffer_mut());
+            },
         )?;
     }
 
@@ -155,12 +152,6 @@ impl LongMessageApp {
         }
     }
 
-    fn message_height(&self, width: u16) -> u16 {
-        self.message_paragraph()
-            .line_count(message_text_width(width))
-            .max(1) as u16
-    }
-
     fn message_paragraph(&self) -> Paragraph<'_> {
         // This is scrollback content. Do not include viewport chrome such as
         // blocks or borders here, because overflow rows are intentionally
@@ -176,31 +167,9 @@ impl LongMessageApp {
         self.message_paragraph().render(area, buffer);
     }
 
-    fn render_message_chrome(&self, area: Rect, buffer: &mut Buffer) {
-        let status = if self.is_streaming() {
-            format!(
-                " assistant streaming: {} / {} chars ",
-                self.next_char,
-                self.source.len()
-            )
-        } else {
-            " assistant stream complete; Esc or Ctrl-C to quit ".to_string()
-        };
-
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green))
-            .title(status)
-            .render(area, buffer);
-    }
-
     fn render_prompt(&self, area: Rect, buffer: &mut Buffer) {
         (&self.prompt).render(area, buffer);
     }
-}
-
-fn message_text_width(area_width: u16) -> u16 {
-    area_width.saturating_sub(2).max(1)
 }
 
 fn new_prompt() -> TextArea<'static> {
@@ -220,7 +189,7 @@ fn new_prompt() -> TextArea<'static> {
 }
 
 fn long_message() -> String {
-    let paragraph = "This is a deliberately long streaming assistant message. It stays as one live paragraph rather than committing completed lines into terminal scrollback. The reproduction depends on terminal width because ratatui wraps the paragraph differently as the width changes. The prompt editor should remain pinned to the bottom while the assistant message area above it behaves like a terminal-backed scroll region. As more text arrives, the newly wrapped rows should become visible and older rows should move into native scrollback. With the current low-level draw API, the viewport grows until it fills the screen, then ratatui clips the paragraph at the top of the live region and the newest text is no longer followed. This makes it clear that lilterm needs a width-aware live region primitive that can render a virtual full-height widget, insert overflow rows into native scrollback, and keep only the tail live above the prompt. ";
+    let paragraph = "This is a deliberately long streaming assistant message. It stays as one live paragraph rather than committing completed lines into terminal scrollback. The reproduction depends on terminal width because ratatui wraps the paragraph differently as the width changes. The prompt editor should remain pinned to the bottom while the assistant message area above it behaves like a terminal-backed scroll region. As more text arrives, the newly wrapped rows should become visible and older rows should move into native scrollback. The layout API renders into a tall virtual buffer, measures the inline rows that were touched, inserts overflow rows into native scrollback, and keeps only the tail live above the prompt. ";
 
     paragraph.repeat(8)
 }
