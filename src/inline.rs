@@ -1176,6 +1176,50 @@ mod tests {
     }
 
     #[test]
+    fn finish_layout_tail_from_unrendered_state_inserts_all_inline_rows() {
+        let width: u16 = 12;
+        let height: u16 = 5;
+        let backend = VT100Backend::new(width, height);
+        let terminal = Terminal::with_options(backend).unwrap();
+        let mut viewport = InlineViewport::new(terminal);
+        let mut state = ScrollbackTailState::new();
+
+        viewport
+            .draw(1, |frame| {
+                let area = frame.area();
+                frame
+                    .buffer_mut()
+                    .set_string(area.x, area.y, "prompt", Style::default());
+            })
+            .unwrap();
+        let baseline_clears = clear_from_cursor_down_count(viewport.terminal().backend().output());
+
+        finish_layout_numbered_rows(&mut viewport, &mut state, 4, 1);
+
+        assert_eq!(state, ScrollbackTailState::new());
+        assert_eq!(viewport.terminal().viewport_area, Rect::new(0, 4, width, 1));
+        assert_eq!(
+            clear_from_cursor_down_count(viewport.terminal().backend().output()),
+            baseline_clears,
+            "finishing an unrendered tail should insert history without clearing the screen"
+        );
+
+        let rows: Vec<String> = viewport
+            .terminal()
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, width)
+            .collect();
+
+        assert!(rows[0].contains("row0"));
+        assert!(rows[1].contains("row1"));
+        assert!(rows[2].contains("row2"));
+        assert!(rows[3].contains("row3"));
+        assert!(rows[4].contains("prompt"));
+    }
+
+    #[test]
     fn scrollback_tail_grows_down_from_non_bottom_prompt_without_from_cursor_down_clears() {
         let width: u16 = 12;
         let height: u16 = 6;
