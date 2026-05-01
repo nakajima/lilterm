@@ -11,6 +11,8 @@ use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
 use crossterm::event::EnableFocusChange;
 use crossterm::execute;
+use crossterm::terminal::DisableLineWrap;
+use crossterm::terminal::EnableLineWrap;
 use crossterm::terminal::disable_raw_mode;
 use crossterm::terminal::enable_raw_mode;
 use ratatui::backend::CrosstermBackend;
@@ -22,14 +24,17 @@ pub type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
 pub type CrosstermInlineViewport = InlineViewport<CrosstermBackend<Stdout>>;
 
 pub fn set_modes() -> io::Result<()> {
-    execute!(stdout(), EnableBracketedPaste)?;
+    // Live viewport rows are unstable UI, not logical terminal output. If they
+    // are marked as soft-wrapped, terminal resize reflow can leak old viewport
+    // borders into scrollback.
+    execute!(stdout(), EnableBracketedPaste, DisableLineWrap)?;
     enable_raw_mode()?;
     let _ = execute!(stdout(), EnableFocusChange);
     Ok(())
 }
 
 pub fn restore() -> io::Result<()> {
-    execute!(stdout(), DisableBracketedPaste)?;
+    execute!(stdout(), DisableBracketedPaste, EnableLineWrap)?;
     let _ = execute!(stdout(), DisableFocusChange);
     disable_raw_mode()?;
     let _ = execute!(stdout(), crossterm::cursor::Show);

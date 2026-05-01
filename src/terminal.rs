@@ -345,6 +345,30 @@ where
         Ok(())
     }
 
+    /// Clears a bounded screen area without using terminal scrollback-affecting clears.
+    pub(crate) fn clear_area(&mut self, area: Rect) -> io::Result<()> {
+        let screen_size = self.size()?;
+        let screen = Rect::new(0, 0, screen_size.width, screen_size.height);
+        let area = area.intersection(screen);
+        if area.is_empty() {
+            return Ok(());
+        }
+
+        crate::trace::log_args(format_args!("terminal.clear_area area={area:?}"));
+        let cells = vec![Cell::default(); area.width as usize * area.height as usize];
+        let iter = cells.iter().enumerate().map(|(index, cell)| {
+            let x = area.x + (index % area.width as usize) as u16;
+            let y = area.y + (index / area.width as usize) as u16;
+            (x, y, cell)
+        });
+        self.backend.draw(iter)?;
+        self.last_known_cursor_pos = Position::new(
+            area.x + area.width.saturating_sub(1),
+            area.y + area.height.saturating_sub(1),
+        );
+        Ok(())
+    }
+
     pub fn invalidate_viewport(&mut self) {
         crate::trace::log_changed_args(
             "terminal.invalidate_viewport",

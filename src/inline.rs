@@ -12,6 +12,8 @@ use ratatui::layout::Position;
 use ratatui::layout::Rect;
 use ratatui::layout::Size;
 use ratatui::text::Line;
+use ratatui::text::Span;
+use ratatui::widgets::Widget;
 
 use crate::history::insert_history_lines;
 use crate::terminal::Frame;
@@ -19,6 +21,53 @@ use crate::terminal::Terminal;
 
 const DEFAULT_INLINE_MAX_HEIGHT: u16 = 2000;
 const MEASUREMENT_MARK: &str = "\u{e000}";
+
+/// A render-only view that lilterm can measure by drawing into an offscreen buffer.
+pub trait View {
+    /// Renders this view into the provided area.
+    fn render_view(&mut self, area: Rect, buffer: &mut Buffer);
+}
+
+impl<W> View for W
+where
+    W: Widget + Clone,
+{
+    fn render_view(&mut self, area: Rect, buffer: &mut Buffer) {
+        Widget::render(self.clone(), area, buffer);
+    }
+}
+
+/// One stable or live transcript item managed by lilterm's high-level update API.
+pub trait TranscriptEntry {
+    type View<'a>: View
+    where
+        Self: 'a;
+
+    /// Returns the stable id used to match a live item when it becomes scrollback.
+    fn id(&self) -> String;
+
+    /// Returns the view lilterm should render and measure for this entry.
+    fn view(&self) -> Self::View<'_>;
+}
+
+impl<T> TranscriptEntry for &T
+where
+    T: TranscriptEntry + ?Sized,
+{
+    type View<'a>
+        = T::View<'a>
+    where
+        Self: 'a,
+        T: 'a;
+
+    fn id(&self) -> String {
+        (*self).id()
+    }
+
+    fn view(&self) -> Self::View<'_> {
+        (*self).view()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Region {
@@ -78,6 +127,238 @@ struct MeasuredLayout {
     pinned_bottom_height: u16,
 }
 
+struct RenderedEntry {
+    id: String,
+    buffer: Buffer,
+    height: u16,
+}
+
+struct RenderedFooter {
+    buffer: Buffer,
+    /// Height drawn for this frame, including any retained clearing rows.
+    height: u16,
+    /// Height of footer content rendered by the caller before retained padding.
+    active_height: u16,
+}
+
+impl RenderedFooter {
+    fn empty(width: u16) -> Self {
+        Self {
+            buffer: Buffer::empty(Rect::new(0, 0, width, 0)),
+            height: 0,
+            active_height: 0,
+        }
+    }
+
+    fn pad_to_height(&mut self, height: u16) {
+        if height <= self.height {
+            return;
+        }
+
+        let mut padded = Buffer::empty(Rect::new(0, 0, self.buffer.area.width, height));
+        copy_buffer_rows_to_area(
+            &self.buffer,
+            0,
+            Rect::new(0, 0, self.buffer.area.width, self.height),
+            &mut padded,
+        );
+        self.buffer = padded;
+        self.height = height;
+    }
+}
+
+struct FooterChild {
+    key: String,
+    height: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveTail {
+    id: String,
+    state: ScrollbackTailState,
+}
+
+/// One transactional inline UI update.
+pub struct Ui {
+    screen_size: Size,
+    scrollback_entries: Vec<RenderedEntry>,
+    live_entries: Vec<RenderedEntry>,
+    footer: Option<RenderedFooter>,
+    error: Option<io::Error>,
+}
+
+impl Ui {
+    fn new(screen_size: Size) -> Self {
+        Self {
+            screen_size,
+            scrollback_entries: Vec::new(),
+            live_entries: Vec::new(),
+            footer: None,
+            error: None,
+        }
+    }
+
+    /// Inserts a stable entry into native terminal scrollback.
+    pub fn insert_scrollback<E>(&mut self, entry: E)
+    where
+        E: TranscriptEntry,
+    {
+        let rendered = render_entry(self.screen_size, entry.id(), &mut entry.view(), 1);
+        self.scrollback_entries.push(rendered);
+    }
+
+    /// Renders the current live entry above the footer.
+    pub fn render_live<E>(&mut self, entry: E)
+    where
+        E: TranscriptEntry,
+    {
+        if !self.live_entries.is_empty() {
+            self.error = Some(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only one live entry can be rendered per update",
+            ));
+            return;
+        }
+
+        let rendered = render_entry(self.screen_size, entry.id(), &mut entry.view(), 1);
+        self.live_entries.push(rendered);
+    }
+
+    /// Renders the pinned footer once for this update.
+    pub fn render_footer<F>(&mut self, render: F)
+    where
+        F: FnOnce(&mut Footer),
+    {
+        if self.footer.is_some() {
+            self.error = Some(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "footer can only be rendered once per update",
+            ));
+            return;
+        }
+
+        let mut footer = Footer::new(self.screen_size);
+        render(&mut footer);
+        let (rendered, error) = footer.finish();
+        if self.error.is_none() {
+            self.error = error;
+        }
+        self.footer = Some(rendered);
+    }
+}
+
+/// Builder for vertically stacked pinned footer content.
+pub struct Footer {
+    screen_size: Size,
+    buffer: Buffer,
+    used_height: u16,
+    children: Vec<FooterChild>,
+    error: Option<io::Error>,
+}
+
+impl Footer {
+    fn new(screen_size: Size) -> Self {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, screen_size.width, screen_size.height));
+        mark_measurement_buffer(&mut buffer);
+        Self {
+            screen_size,
+            buffer,
+            used_height: 0,
+            children: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// Renders one keyed footer view below any previously rendered footer views.
+    pub fn render<K, V>(&mut self, key: K, view: &mut V)
+    where
+        K: Into<String>,
+        V: View,
+    {
+        if self.error.is_some() {
+            return;
+        }
+
+        let key = key.into();
+        if self.children.iter().any(|child| child.key == key) {
+            self.error = Some(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate footer key: {key}"),
+            ));
+            return;
+        }
+
+        let remaining_height = self.screen_size.height.saturating_sub(self.used_height);
+        if remaining_height == 0 {
+            self.error = Some(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "footer content is taller than the terminal",
+            ));
+            return;
+        }
+
+        let area = Rect::new(
+            0,
+            self.used_height,
+            self.screen_size.width,
+            remaining_height,
+        );
+        view.render_view(area, &mut self.buffer);
+        let height = touched_height(&self.buffer, area);
+        self.used_height = self.used_height.saturating_add(height);
+        self.children.push(FooterChild { key, height });
+    }
+
+    fn finish(mut self) -> (RenderedFooter, Option<io::Error>) {
+        clear_measurement_marks(&mut self.buffer);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, self.screen_size.width, self.used_height));
+        copy_buffer_rows_to_area(
+            &self.buffer,
+            0,
+            Rect::new(0, 0, self.screen_size.width, self.used_height),
+            &mut buffer,
+        );
+        debug_assert_eq!(
+            self.used_height,
+            self.children.iter().map(|child| child.height).sum::<u16>()
+        );
+        (
+            RenderedFooter {
+                buffer,
+                height: self.used_height,
+                active_height: self.used_height,
+            },
+            self.error,
+        )
+    }
+}
+
+fn render_entry<V>(screen_size: Size, id: String, view: &mut V, min_height: u16) -> RenderedEntry
+where
+    V: View,
+{
+    let max_height = DEFAULT_INLINE_MAX_HEIGHT.max(min_height);
+    let mut probe_buffer = Buffer::empty(Rect::new(0, 0, screen_size.width, max_height));
+    mark_measurement_buffer(&mut probe_buffer);
+    let probe_area = probe_buffer.area;
+    view.render_view(probe_area, &mut probe_buffer);
+
+    let height = touched_height(&probe_buffer, probe_area)
+        .max(min_height)
+        .min(max_height);
+    clear_measurement_marks(&mut probe_buffer);
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, screen_size.width, height));
+    copy_buffer_rows_to_area(
+        &probe_buffer,
+        0,
+        Rect::new(0, 0, screen_size.width, height),
+        &mut buffer,
+    );
+
+    RenderedEntry { id, buffer, height }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollbackTailState {
     committed_rows: u16,
@@ -114,6 +395,8 @@ where
 {
     terminal: Terminal<B>,
     pending_history_lines: Vec<Line<'static>>,
+    previous_footer_active_height: u16,
+    live_tail: Option<LiveTail>,
 }
 
 impl<B> InlineViewport<B>
@@ -124,6 +407,8 @@ where
         Self {
             terminal,
             pending_history_lines: Vec::new(),
+            previous_footer_active_height: 0,
+            live_tail: None,
         }
     }
 
@@ -153,6 +438,91 @@ where
         I: IntoIterator<Item = Line<'static>>,
     {
         self.insert_history_lines(lines);
+    }
+
+    /// Applies one high-level lilterm update.
+    pub fn update<F>(&mut self, update: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut Ui),
+    {
+        let screen_size = self.terminal.size()?;
+        let mut ui = Ui::new(screen_size);
+        update(&mut ui);
+        if let Some(error) = ui.error {
+            return Err(error);
+        }
+        self.apply_update(ui)
+    }
+
+    fn apply_update(&mut self, ui: Ui) -> io::Result<()> {
+        let mut footer = ui
+            .footer
+            .unwrap_or_else(|| RenderedFooter::empty(ui.screen_size.width));
+        footer.pad_to_height(
+            self.previous_footer_active_height
+                .min(ui.screen_size.height),
+        );
+        let footer_active_height = footer.active_height;
+
+        for entry in ui.scrollback_entries {
+            if self
+                .live_tail
+                .as_ref()
+                .is_some_and(|live_tail| live_tail.id == entry.id)
+            {
+                let mut live_tail = self.live_tail.take().expect("checked live tail exists");
+                let full_buffer = combine_tail_and_footer(&entry.buffer, &footer.buffer);
+                self.finish_tail_buffer(
+                    &mut live_tail.state,
+                    &full_buffer,
+                    entry.height,
+                    footer.height,
+                )?;
+            } else {
+                self.insert_history_lines(buffer_rows_to_lines(&entry.buffer, 0, entry.height));
+            }
+        }
+
+        if let Some(entry) = ui.live_entries.into_iter().next() {
+            let mut live_tail = match self.live_tail.take() {
+                Some(live_tail) if live_tail.id == entry.id => live_tail,
+                _ => LiveTail {
+                    id: entry.id.clone(),
+                    state: ScrollbackTailState::new(),
+                },
+            };
+            let full_buffer = combine_tail_and_footer(&entry.buffer, &footer.buffer);
+            self.draw_tail_buffer(
+                &mut live_tail.state,
+                &full_buffer,
+                entry.height,
+                footer.height,
+            )?;
+            self.live_tail = Some(live_tail);
+        } else {
+            self.live_tail = None;
+            self.draw_footer_buffer(&footer)?;
+        }
+
+        self.previous_footer_active_height = footer_active_height;
+        Ok(())
+    }
+
+    fn draw_footer_buffer(&mut self, footer: &RenderedFooter) -> io::Result<()> {
+        if footer.height == 0 {
+            return self.with_synchronized_update(|this| {
+                Self::flush_pending_history_lines(
+                    &mut this.terminal,
+                    &mut this.pending_history_lines,
+                )?;
+                Self::update_inline_viewport(&mut this.terminal, 0)?;
+                Ok(())
+            });
+        }
+
+        self.draw(footer.height, |frame| {
+            copy_buffer_rows_to_area(&footer.buffer, 0, frame.area(), frame.buffer_mut());
+        })
     }
 
     pub fn draw_layout_tail<R, F>(
@@ -221,8 +591,7 @@ where
 
         self.with_synchronized_update(|this| {
             if let Some(new_area) = pending_viewport_area.take() {
-                this.terminal.set_viewport_area(new_area);
-                this.terminal.clear()?;
+                Self::relocate_viewport_after_resize(&mut this.terminal, new_area)?;
             }
 
             let mut needs_full_repaint = Self::update_inline_viewport(&mut this.terminal, height)?;
@@ -380,8 +749,7 @@ where
 
         self.with_synchronized_update(|this| {
             if let Some(new_area) = pending_viewport_area.take() {
-                this.terminal.set_viewport_area(new_area);
-                this.terminal.clear()?;
+                Self::relocate_viewport_after_resize(&mut this.terminal, new_area)?;
             }
 
             let mut needs_full_repaint = Self::flush_pending_history_lines(
@@ -612,6 +980,21 @@ where
             (Err(err), _) => Err(err),
             (Ok(_), Err(err)) => Err(err),
         }
+    }
+
+    /// Clears both possible locations for live UI after an external resize moved the cursor.
+    fn relocate_viewport_after_resize(
+        terminal: &mut Terminal<B>,
+        new_area: Rect,
+    ) -> io::Result<()> {
+        let old_area = terminal.viewport_area;
+        terminal.clear_area(old_area)?;
+        if new_area != old_area {
+            terminal.clear_area(new_area)?;
+        }
+        terminal.set_viewport_area(new_area);
+        terminal.invalidate_viewport();
+        Ok(())
     }
 
     fn update_inline_viewport(terminal: &mut Terminal<B>, height: u16) -> io::Result<bool> {
@@ -849,6 +1232,80 @@ fn copy_buffer_rows_to_area(
     }
 }
 
+fn combine_tail_and_footer(tail: &Buffer, footer: &Buffer) -> Buffer {
+    let width = tail.area.width.max(footer.area.width);
+    let height = tail.area.height.saturating_add(footer.area.height);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+    copy_buffer_rows_to_area(
+        tail,
+        0,
+        Rect::new(0, 0, width, tail.area.height),
+        &mut buffer,
+    );
+    copy_buffer_rows_to_area(
+        footer,
+        0,
+        Rect::new(0, tail.area.height, width, footer.area.height),
+        &mut buffer,
+    );
+    buffer
+}
+
+fn buffer_rows_to_lines(buffer: &Buffer, start_row: u16, row_count: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(row_count as usize);
+    let end_row = start_row.saturating_add(row_count).min(buffer.area.height);
+
+    for row in start_row..end_row {
+        let y = buffer.area.y.saturating_add(row);
+        let last_non_space = (buffer.area.left()..buffer.area.right()).rev().find(|&x| {
+            buffer
+                .cell((x, y))
+                .is_some_and(|cell| !cell.skip && cell.symbol() != " ")
+        });
+
+        let Some(last_x) = last_non_space else {
+            lines.push(Line::from(""));
+            continue;
+        };
+
+        let mut spans = Vec::new();
+        let mut current_style = None;
+        let mut current_text = String::new();
+
+        for x in buffer.area.left()..=last_x {
+            let Some(cell) = buffer.cell((x, y)) else {
+                continue;
+            };
+            if cell.skip {
+                continue;
+            }
+
+            let style = cell.style();
+            if current_style == Some(style) {
+                current_text.push_str(cell.symbol());
+                continue;
+            }
+
+            if let Some(style) = current_style.replace(style)
+                && !current_text.is_empty()
+            {
+                spans.push(Span::styled(std::mem::take(&mut current_text), style));
+            }
+            current_text.push_str(cell.symbol());
+        }
+
+        if let Some(style) = current_style
+            && !current_text.is_empty()
+        {
+            spans.push(Span::styled(current_text, style));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,6 +1325,61 @@ mod tests {
     fn render_numbered_rows_count(row_count: u16, area: Rect, buffer: &mut Buffer) {
         for y in 0..row_count.min(area.height) {
             buffer.set_string(area.x, area.y + y, format!("row{y}"), Style::default());
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct NumberedEntry {
+        id: &'static str,
+        rows: u16,
+    }
+
+    impl TranscriptEntry for NumberedEntry {
+        type View<'a>
+            = NumberedView
+        where
+            Self: 'a;
+
+        fn id(&self) -> String {
+            self.id.to_owned()
+        }
+
+        fn view(&self) -> Self::View<'_> {
+            NumberedView { rows: self.rows }
+        }
+    }
+
+    struct NumberedView {
+        rows: u16,
+    }
+
+    impl View for NumberedView {
+        fn render_view(&mut self, area: Rect, buffer: &mut Buffer) {
+            render_numbered_rows_count(self.rows, area, buffer);
+        }
+    }
+
+    struct PromptView;
+
+    impl View for PromptView {
+        fn render_view(&mut self, area: Rect, buffer: &mut Buffer) {
+            buffer.set_string(area.x, area.y, "prompt", Style::default());
+        }
+    }
+
+    struct TextRows(&'static [&'static str]);
+
+    impl View for TextRows {
+        fn render_view(&mut self, area: Rect, buffer: &mut Buffer) {
+            for (index, line) in self.0.iter().enumerate() {
+                let Ok(offset) = u16::try_from(index) else {
+                    break;
+                };
+                if offset >= area.height {
+                    break;
+                }
+                buffer.set_string(area.x, area.y + offset, *line, Style::default());
+            }
         }
     }
 
@@ -978,6 +1490,145 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("row5")));
         assert!(rows.iter().any(|row| row.contains("prompt")));
         assert!(!rows.iter().any(|row| row.contains("row0")));
+    }
+
+    #[test]
+    fn keyed_footer_shrink_moves_later_children_up_and_pads_bottom_for_one_frame() {
+        let width: u16 = 12;
+        let height: u16 = 8;
+        let backend = VT100Backend::new(width, height);
+        let terminal = Terminal::with_options(backend).unwrap();
+        let mut viewport = InlineViewport::new(terminal);
+
+        viewport
+            .update(|ui| {
+                ui.render_footer(|footer| {
+                    footer.render("a", &mut TextRows(&["a0", "a1"]));
+                    footer.render("b", &mut TextRows(&["b0", "b1", "b2"]));
+                    footer.render("c", &mut TextRows(&["c0"]));
+                });
+            })
+            .unwrap();
+
+        viewport
+            .update(|ui| {
+                ui.render_footer(|footer| {
+                    footer.render("a", &mut TextRows(&["a0", "a1"]));
+                    footer.render("c", &mut TextRows(&["c0"]));
+                });
+            })
+            .unwrap();
+
+        assert_eq!(viewport.terminal().viewport_area.height, 6);
+        let rows: Vec<String> = viewport
+            .terminal()
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, width)
+            .collect();
+
+        assert!(rows[0].contains("a0"));
+        assert!(rows[1].contains("a1"));
+        assert!(rows[2].contains("c0"));
+        assert!(!rows.iter().any(|row| row.contains("b0")));
+        assert!(!rows.iter().any(|row| row.contains("b1")));
+        assert!(!rows.iter().any(|row| row.contains("b2")));
+
+        viewport
+            .update(|ui| {
+                ui.render_footer(|footer| {
+                    footer.render("a", &mut TextRows(&["a0", "a1"]));
+                    footer.render("c", &mut TextRows(&["c0"]));
+                });
+            })
+            .unwrap();
+
+        assert_eq!(viewport.terminal().viewport_area.height, 3);
+        let rows: Vec<String> = viewport
+            .terminal()
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, width)
+            .collect();
+        assert!(rows[0].contains("a0"));
+        assert!(rows[1].contains("a1"));
+        assert!(rows[2].contains("c0"));
+    }
+
+    #[test]
+    fn keyed_footer_rejects_duplicate_keys() {
+        let width: u16 = 12;
+        let height: u16 = 8;
+        let backend = VT100Backend::new(width, height);
+        let terminal = Terminal::with_options(backend).unwrap();
+        let mut viewport = InlineViewport::new(terminal);
+
+        let error = viewport
+            .update(|ui| {
+                ui.render_footer(|footer| {
+                    footer.render("duplicate", &mut TextRows(&["first"]));
+                    footer.render("duplicate", &mut TextRows(&["second"]));
+                });
+            })
+            .expect_err("duplicate footer key should fail");
+
+        assert!(error.to_string().contains("duplicate footer key"));
+    }
+
+    #[test]
+    fn update_renders_live_entry_with_footer_and_finalizes_by_id() {
+        let width: u16 = 10;
+        let height: u16 = 5;
+        let backend = VT100Backend::new(width, height);
+        let terminal = Terminal::with_options(backend).unwrap();
+        let mut viewport = InlineViewport::new(terminal);
+
+        viewport
+            .update(|ui| {
+                ui.render_live(NumberedEntry { id: "a", rows: 4 });
+                ui.render_footer(|footer| footer.render("prompt", &mut PromptView));
+            })
+            .unwrap();
+        viewport
+            .update(|ui| {
+                ui.render_live(NumberedEntry { id: "a", rows: 6 });
+                ui.render_footer(|footer| footer.render("prompt", &mut PromptView));
+            })
+            .unwrap();
+
+        assert_eq!(
+            viewport
+                .live_tail
+                .as_ref()
+                .map(|live_tail| live_tail.state.committed_rows()),
+            Some(2)
+        );
+
+        viewport
+            .update(|ui| {
+                ui.insert_scrollback(NumberedEntry { id: "a", rows: 6 });
+                ui.render_footer(|footer| footer.render("prompt", &mut PromptView));
+            })
+            .unwrap();
+
+        assert!(viewport.live_tail.is_none());
+        assert_eq!(viewport.terminal().viewport_area, Rect::new(0, 4, width, 1));
+
+        let rows: Vec<String> = viewport
+            .terminal()
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, width)
+            .collect();
+
+        assert!(rows[0].contains("row2"));
+        assert!(rows[1].contains("row3"));
+        assert!(rows[2].contains("row4"));
+        assert!(rows[3].contains("row5"));
+        assert!(rows[4].contains("prompt"));
     }
 
     #[test]
@@ -1381,6 +2032,60 @@ mod tests {
         assert!(rows[2].contains("row6"));
         assert!(rows[3].contains("row7"));
         assert!(rows[4].contains("prompt"));
+    }
+
+    #[test]
+    fn resize_with_cursor_drift_clears_stale_footer_rows() {
+        let width: u16 = 30;
+        let height: u16 = 8;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).unwrap();
+        terminal.set_viewport_area(Rect::new(0, 4, width, 3));
+        let mut viewport = InlineViewport::new(terminal);
+
+        viewport
+            .update(|ui| {
+                ui.render_footer(|footer| {
+                    footer.render("prompt", &mut TextRows(&["Prompt old", "body", "bottom"]));
+                });
+            })
+            .unwrap();
+
+        viewport
+            .terminal_mut()
+            .backend_mut()
+            .vt100_mut()
+            .set_size(height, 20);
+        // Simulate tmux reporting the cursor one row lower after the resize.
+        viewport
+            .terminal_mut()
+            .backend_mut()
+            .write_all(b"\x1b[8;1H")
+            .unwrap();
+
+        viewport
+            .update(|ui| {
+                ui.render_footer(|footer| {
+                    footer.render("prompt", &mut TextRows(&["Prompt new", "body", "bottom"]));
+                });
+            })
+            .unwrap();
+
+        let rows: Vec<String> = viewport
+            .terminal()
+            .backend()
+            .vt100()
+            .screen()
+            .rows(0, 20)
+            .collect();
+
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("Prompt")).count(),
+            1,
+            "resize redraw should not leave an old prompt border above the current one: {rows:?}"
+        );
+        assert!(rows.iter().any(|row| row.contains("Prompt new")));
+        assert!(!rows.iter().any(|row| row.contains("Prompt old")));
     }
 
     #[test]

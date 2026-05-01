@@ -95,7 +95,8 @@ impl Backend for VT100Backend {
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        Ok(self.vt100().screen().cursor_position().into())
+        let (row, column) = self.vt100().screen().cursor_position();
+        Ok(Position::new(column, row))
     }
 
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {

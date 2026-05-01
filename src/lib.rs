@@ -5,10 +5,14 @@ pub mod terminal;
 pub mod trace;
 
 pub use history::insert_history_lines;
+pub use inline::Footer;
 pub use inline::InlineViewport;
 pub use inline::LayoutFrame;
 pub use inline::Region;
 pub use inline::ScrollbackTailState;
+pub use inline::TranscriptEntry;
+pub use inline::Ui;
+pub use inline::View;
 pub use session::CrosstermInlineViewport;
 pub use session::CrosstermTerminal;
 pub use session::Session;
