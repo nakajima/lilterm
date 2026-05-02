@@ -5,6 +5,10 @@ use std::io::stdin;
 use std::io::stdout;
 use std::ops::Deref;
 use std::ops::DerefMut;
+use std::panic;
+use std::sync::Once;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
@@ -23,21 +27,85 @@ use crate::terminal::Terminal;
 pub type CrosstermTerminal = Terminal<CrosstermBackend<Stdout>>;
 pub type CrosstermInlineViewport = InlineViewport<CrosstermBackend<Stdout>>;
 
+static RESTORE_HOOKS: Once = Once::new();
+static TERMINAL_NEEDS_RESTORE: AtomicBool = AtomicBool::new(false);
+
 pub fn set_modes() -> io::Result<()> {
-    // Live viewport rows are unstable UI, not logical terminal output. If they
-    // are marked as soft-wrapped, terminal resize reflow can leak old viewport
-    // borders into scrollback.
-    execute!(stdout(), EnableBracketedPaste, DisableLineWrap)?;
-    enable_raw_mode()?;
-    let _ = execute!(stdout(), EnableFocusChange);
-    Ok(())
+    install_restore_hooks();
+    TERMINAL_NEEDS_RESTORE.store(true, Ordering::SeqCst);
+
+    let result = (|| {
+        // Live viewport rows are unstable UI, not logical terminal output. If they
+        // are marked as soft-wrapped, terminal resize reflow can leak old viewport
+        // borders into scrollback.
+        execute!(stdout(), EnableBracketedPaste, DisableLineWrap)?;
+        enable_raw_mode()?;
+        let _ = execute!(stdout(), EnableFocusChange);
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = restore();
+    }
+
+    result
 }
 
 pub fn restore() -> io::Result<()> {
-    execute!(stdout(), DisableBracketedPaste, EnableLineWrap)?;
+    if TERMINAL_NEEDS_RESTORE
+        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let result = restore_modes();
+    if result.is_err() {
+        TERMINAL_NEEDS_RESTORE.store(true, Ordering::SeqCst);
+    }
+    result
+}
+
+fn install_restore_hooks() {
+    RESTORE_HOOKS.call_once(|| {
+        let previous_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            emergency_restore();
+            previous_hook(info);
+        }));
+
+        install_exit_restore_hook();
+    });
+}
+
+#[cfg(unix)]
+fn install_exit_restore_hook() {
+    unsafe {
+        let _ = libc::atexit(emergency_restore_atexit);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_exit_restore_hook() {}
+
+#[cfg(unix)]
+extern "C" fn emergency_restore_atexit() {
+    emergency_restore();
+}
+
+fn emergency_restore() {
+    let _ = restore();
+}
+
+fn restore_modes() -> io::Result<()> {
+    let bracketed_paste_result = execute!(stdout(), DisableBracketedPaste, EnableLineWrap);
     let _ = execute!(stdout(), DisableFocusChange);
-    disable_raw_mode()?;
-    let _ = execute!(stdout(), crossterm::cursor::Show);
+    let raw_mode_result = disable_raw_mode();
+    let cursor_result = execute!(stdout(), crossterm::cursor::Show);
+
+    bracketed_paste_result?;
+    raw_mode_result?;
+    cursor_result?;
     Ok(())
 }
 
@@ -78,7 +146,13 @@ impl Session {
         flush_terminal_input_buffer();
 
         let backend = CrosstermBackend::new(stdout());
-        let terminal = Terminal::with_options(backend)?;
+        let terminal = match Terminal::with_options(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = restore();
+                return Err(error);
+            }
+        };
         Ok(Self {
             viewport: InlineViewport::new(terminal),
             restore_on_drop: true,
